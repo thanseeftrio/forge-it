@@ -3,15 +3,32 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from backend.app.core.config import settings
-from backend.app.schemas.agent import PlanRequest, PlanResponse, PlanStep
-from backend.app.services.project_service import project_service
+from typing import Any, Dict, List, Optional, Tuple
 
-# Ensure workspace root is in sys.path to dynamically import from ai-agent when ready
-WORKSPACE_ROOT = str(settings.BASE_DIR)
-if WORKSPACE_ROOT not in sys.path:
-    sys.path.insert(0, WORKSPACE_ROOT)
+# Ensure repository root is in sys.path for absolute imports
+_repo_root = str(Path(__file__).resolve().parents[3])
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from backend.app.core.config import settings  # noqa: E402
+from backend.app.schemas.agent import (  # noqa: E402
+    PlanRequest,
+    PlanResponse,
+    PlanStep,
+)
+from backend.app.services.project_service import (  # noqa: E402
+    project_service,
+)
+
+# Graceful import of Google GenAI SDK
+try:
+    from google import genai
+    from google.genai import types
+    _GENAI_AVAILABLE = True
+except ImportError:
+    genai = None  # type: ignore
+    types = None  # type: ignore
+    _GENAI_AVAILABLE = False
 
 
 class AIAgentService:
@@ -19,41 +36,58 @@ class AIAgentService:
     Connects Backend to the AI Agent (Member 3) and Gemini API.
     Priority:
     1. Member 3 planner module (`ai-agent/planner.py`) if implemented.
-    2. Google Gemini API via `google-genai` SDK when `GEMINI_API_KEY` is present.
+    2. Google Gemini API via `google-genai` SDK when `GEMINI_API_KEY` is set.
     3. Fallback deterministic rule-based planner.
     """
 
-    def _call_member3_planner(self, instruction: str, project_data: dict) -> Optional[List[PlanStep]]:
+    def _call_member3_planner(
+        self, instruction: str, project_data: Dict[str, Any]
+    ) -> Optional[List[PlanStep]]:
         """
-        Attempt to delegate planning to ai-agent module if implemented by Member 3.
+        Attempt to delegate planning to ai-agent module if implemented.
+        Uses importlib.util to safely import from 'ai-agent' despite hyphen.
         """
         try:
-            import importlib
-            ai_planner = importlib.import_module("ai-agent.planner")
-            if hasattr(ai_planner, "generate_plan"):
-                raw_steps = ai_planner.generate_plan(instruction, project_data)
-                return [PlanStep(**s) for s in raw_steps]
+            planner_path = Path(settings.BASE_DIR) / "ai-agent" / "planner.py"
+            if not planner_path.exists():
+                return None
+
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "ai_agent_planner", str(planner_path)
+            )
+            if spec and spec.loader:
+                ai_planner = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ai_planner)
+                if hasattr(ai_planner, "generate_plan"):
+                    raw_steps = ai_planner.generate_plan(
+                        instruction, project_data
+                    )
+                    if isinstance(raw_steps, list) and raw_steps:
+                        return [PlanStep(**s) for s in raw_steps]
         except Exception:
             return None
         return None
 
-    def _call_gemini_planner(self, instruction: str, project_data: dict) -> Optional[tuple[str, List[PlanStep]]]:
+    def _call_gemini_planner(
+        self, instruction: str, project_data: Dict[str, Any]
+    ) -> Optional[Tuple[str, List[PlanStep]]]:
         """
-        Call Gemini using official google-genai SDK to generate a safe execution plan.
+        Call Gemini using google-genai SDK to generate a safe plan.
         """
+        if not _GENAI_AVAILABLE:
+            return None
+
         api_key = settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             return None
 
         try:
-            from google import genai
-            from google.genai import types
-
             client = genai.Client(api_key=api_key)
 
             allowed_ops = settings.ALLOWED_OPERATIONS
             prompt = f"""
-You are the AI Planner for FORGE IT, an engineering workspace assistant for PCB (KiCad) and IC (Verilog/RTL) workflows.
+You are the AI Planner for FORGE IT (PCB & IC engineering workflows).
 Generate a structured JSON execution plan for the user instruction.
 
 Allowed operations strictly limited to: {json.dumps(allowed_ops)}
@@ -76,7 +110,7 @@ Output valid JSON matching this exact structure:
       "operation": "one of the allowed operations",
       "parameters": {{}},
       "description": "What this step performs",
-      "requires_approval": true or false,
+      "requires_approval": true,
       "is_destructive": false
     }}
   ]
@@ -96,7 +130,9 @@ Do NOT output code blocks or markdown, output pure JSON only.
                 return None
 
             data = json.loads(response.text)
-            summary = data.get("summary", f"AI-generated plan for: '{instruction}'")
+            summary = data.get(
+                "summary", f"AI-generated plan for: '{instruction}'"
+            )
             raw_steps = data.get("steps", [])
 
             valid_steps: List[PlanStep] = []
@@ -104,7 +140,7 @@ Do NOT output code blocks or markdown, output pure JSON only.
                 op = step_data.get("operation")
                 # Filter strictly against allowed operations
                 if op in settings.ALLOWED_OPERATIONS:
-                    # Enforce approval for engineering tool runs
+                    # Enforce approval for all engineering tool operations
                     if op != "inspect_project":
                         step_data["requires_approval"] = True
                     valid_steps.append(PlanStep(**step_data))
@@ -112,7 +148,7 @@ Do NOT output code blocks or markdown, output pure JSON only.
             if valid_steps:
                 return summary, valid_steps
 
-        except Exception as e:
+        except Exception:
             # Fall back safely if API call fails
             return None
 
@@ -142,7 +178,9 @@ Do NOT output code blocks or markdown, output pure JSON only.
             )
 
         # 3. Call Gemini if API key is configured
-        gemini_result = self._call_gemini_planner(request.instruction, project_data)
+        gemini_result = self._call_gemini_planner(
+            request.instruction, project_data
+        )
         if gemini_result:
             summary, gemini_steps = gemini_result
             return PlanResponse(
@@ -151,7 +189,9 @@ Do NOT output code blocks or markdown, output pure JSON only.
                 instruction=request.instruction,
                 summary=summary,
                 steps=gemini_steps,
-                requires_approval=any(s.requires_approval for s in gemini_steps),
+                requires_approval=any(
+                    s.requires_approval for s in gemini_steps
+                ),
                 agent_provider=f"Gemini ({settings.GEMINI_MODEL})",
             )
 
@@ -160,14 +200,24 @@ Do NOT output code blocks or markdown, output pure JSON only.
         p_type = project_info.project_type
         inst_lower = request.instruction.lower()
 
-        if p_type == "pcb" or "pcb" in inst_lower or "drc" in inst_lower:
+        is_pcb = (
+            p_type == "pcb" or "pcb" in inst_lower or "drc" in inst_lower
+        )
+        is_ic = (
+            p_type == "ic"
+            or "verilog" in inst_lower
+            or "lint" in inst_lower
+            or "rtl" in inst_lower
+        )
+
+        if is_pcb:
             steps.append(
                 PlanStep(
                     step_number=1,
                     application="ForgeBackend",
                     operation="inspect_project",
                     parameters={"project_path": request.project_path},
-                    description="Inspect KiCad project tree and verify board layout files.",
+                    description="Inspect KiCad project tree and files.",
                     requires_approval=False,
                 )
             )
@@ -177,19 +227,21 @@ Do NOT output code blocks or markdown, output pure JSON only.
                     application="KiCad",
                     operation="kicad_drc",
                     parameters={"project_path": request.project_path},
-                    description="Run KiCad Design Rules Check (DRC) and extract violations.",
+                    description="Run KiCad DRC and extract violations.",
                     requires_approval=True,
                 )
             )
-            summary = f"Generated 2-step plan to inspect PCB and run KiCad DRC for: '{request.instruction}'"
-        elif p_type == "ic" or "verilog" in inst_lower or "lint" in inst_lower or "rtl" in inst_lower:
+            summary = (
+                f"Generated 2-step plan for PCB DRC: '{request.instruction}'"
+            )
+        elif is_ic:
             steps.append(
                 PlanStep(
                     step_number=1,
                     application="ForgeBackend",
                     operation="inspect_project",
                     parameters={"project_path": request.project_path},
-                    description="Scan RTL hierarchy and discover Verilog modules.",
+                    description="Scan RTL hierarchy and discover modules.",
                     requires_approval=False,
                 )
             )
@@ -203,7 +255,9 @@ Do NOT output code blocks or markdown, output pure JSON only.
                     requires_approval=True,
                 )
             )
-            summary = f"Generated 2-step plan to inspect RTL and run Verilator lint for: '{request.instruction}'"
+            summary = (
+                f"Generated 2-step plan for RTL lint: '{request.instruction}'"
+            )
         else:
             steps.append(
                 PlanStep(
