@@ -21,11 +21,13 @@ from backend.app.services.project_service import (  # noqa: E402
 )
 
 # Graceful import of Google GenAI SDK
+# Uses dynamic import to avoid unresolved-import errors in IDEs
 try:
-    from google import genai
-    from google.genai import types
+    import importlib
+    genai = importlib.import_module("google.genai")
+    types = importlib.import_module("google.genai.types")
     _GENAI_AVAILABLE = True
-except ImportError:
+except Exception:
     genai = None  # type: ignore
     types = None  # type: ignore
     _GENAI_AVAILABLE = False
